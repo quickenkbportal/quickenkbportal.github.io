@@ -1,97 +1,88 @@
-class BlogFeedLoader {
+class FastBlogLoader {
     constructor() {
-        this.rssUrl = 'https://helpguide-blog.blogspot.com/feeds/posts/default?alt=rss';
-        this.proxyUrl = 'https://api.allorigins.win/raw?url=';
+        this.rssUrl = 'https://helpguide-blog.blogspot.com/feeds/posts/default?alt=rss&max-results=12';
+        this.proxyUrls = [
+            'https://api.allorigins.win/raw?url=',
+            'https://corsproxy.io/?',
+            'https://thingproxy.freeboard.io/fetch/'
+        ];
+        this.currentProxyIndex = 0;
         this.init();
     }
 
     async init() {
-        try {
-            this.showLoading();
-            const posts = await this.fetchPosts();
+        const posts = await this.fetchWithFallback();
+        if (posts.length) {
             this.renderPosts(posts);
-            this.hideLoading();
-        } catch (error) {
-            console.error('Failed to load blog feed:', error);
+        } else {
             this.showError();
         }
     }
 
-    async fetchPosts() {
-        // Use CORS proxy for Blogger RSS
-        const url = `${this.proxyUrl}${encodeURIComponent(this.rssUrl)}`;
-        
-        const response = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'Accept': 'application/rss+xml, application/xml, text/xml'
+    async fetchWithFallback() {
+        for (let i = 0; i < this.proxyUrls.length; i++) {
+            try {
+                return await this.fetchPosts(this.proxyUrls[this.currentProxyIndex]);
+            } catch (e) {
+                console.warn(`Proxy ${this.currentProxyIndex} failed:`, e);
+                this.currentProxyIndex = (this.currentProxyIndex + 1) % this.proxyUrls.length;
             }
+        }
+        return [];
+    }
+
+    async fetchPosts(proxyUrl) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout
+
+        const url = `${proxyUrl}${encodeURIComponent(this.rssUrl)}`;
+        const response = await fetch(url, {
+            signal: controller.signal,
+            cache: 'default'
         });
 
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
+        clearTimeout(timeoutId);
 
-        const rssText = await response.text();
-        const posts = this.parseRSS(rssText);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         
-        // Limit to 12 most recent posts
-        return posts.slice(0, 12);
+        const rssText = await response.text();
+        return this.parseRSS(rssText);
     }
 
     parseRSS(rssXml) {
         const parser = new DOMParser();
         const xmlDoc = parser.parseFromString(rssXml, 'text/xml');
-        
-        // Check for parsing errors
-        const parserError = xmlDoc.querySelector('parsererror');
-        if (parserError) {
-            throw new Error('RSS parsing failed');
-        }
+        if (xmlDoc.querySelector('parsererror')) throw new Error('Parse error');
 
-        const items = xmlDoc.querySelectorAll('item');
-        const posts = [];
-
-        items.forEach(item => {
-            const title = item.querySelector('title')?.textContent || 'Untitled';
-            const link = item.querySelector('link')?.textContent || '#';
-            const description = item.querySelector('description')?.textContent || '';
+        return Array.from(xmlDoc.querySelectorAll('item')).slice(0, 12).map(item => {
+            const title = item.querySelector('title')?.textContent?.trim() || 'Untitled';
+            const link = item.querySelector('link')?.textContent?.trim() || '#';
+            const descRaw = item.querySelector('description')?.textContent || '';
             
-            // Clean and truncate description
-            const cleanDesc = this.truncateDescription(description, 120);
-            
-            posts.push({
-                title: this.sanitizeTitle(title),
-                description: cleanDesc,
+            return {
+                title,
+                description: this.truncate(this.stripHtml(descRaw), 100),
                 url: link
-            });
-        });
-
-        return posts;
+            };
+        }).filter(post => post.title !== 'Untitled');
     }
 
-    truncateDescription(text, maxWords) {
-        const words = text.replace(/<[^>]*>/g, '').trim().split(/\s+/);
-        if (words.length <= maxWords) return text;
-        
-        return words.slice(0, maxWords).join(' ') + '...';
+    stripHtml(html) {
+        const div = document.createElement('div');
+        div.innerHTML = html;
+        return div.textContent?.trim() || '';
     }
 
-    sanitizeTitle(title) {
-        return title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    truncate(text, maxLen) {
+        return text.length > maxLen ? text.slice(0, maxLen).trim() + '...' : text;
     }
 
     renderPosts(posts) {
         const container = document.getElementById('postsGrid');
-        if (!posts.length) {
-            container.innerHTML = '<p class="no-posts">No articles found.</p>';
-            return;
-        }
-
         container.innerHTML = posts.map(post => `
-            <article class="post-card">
-                <h2 class="post-title">${post.title}</h2>
-                <div class="post-description">${post.description}</div>
+            <article class="post-card" role="article">
+                <h3 class="post-title">${this.escapeHtml(post.title)}</h3>
+                <p class="post-description">${post.description}</p>
                 <a href="${post.url}" class="view-btn" target="_blank" rel="noopener noreferrer">
                     View Full Blog →
                 </a>
@@ -99,30 +90,24 @@ class BlogFeedLoader {
         `).join('');
     }
 
-    showLoading() {
-        document.getElementById('loading').style.display = 'flex';
-        document.getElementById('error').style.display = 'none';
-        document.getElementById('postsGrid').innerHTML = '';
-    }
-
-    hideLoading() {
-        document.getElementById('loading').style.display = 'none';
+    escapeHtml(text) {
+        const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+        return text.replace(/[&<>"']/g, m => map[m]);
     }
 
     showError() {
+        document.getElementById('postsGrid').innerHTML = `
+            <div class="error">
+                <p>Posts loading temporarily unavailable. Refresh to retry.</p>
+            </div>
+        `;
         document.getElementById('loading').style.display = 'none';
-        document.getElementById('error').style.display = 'block';
     }
 }
 
-// Initialize when DOM is loaded
-document.addEventListener('DOMContentLoaded', () => {
-    new BlogFeedLoader();
-});
-
-// Refresh feed every 5 minutes for freshness
-setInterval(() => {
-    if (document.visibilityState === 'visible') {
-        new BlogFeedLoader();
-    }
-}, 5 * 60 * 1000);
+// Load immediately
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => new FastBlogLoader());
+} else {
+    new FastBlogLoader();
+}
